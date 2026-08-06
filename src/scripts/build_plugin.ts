@@ -14,8 +14,8 @@ const BUILTIN_PLUGINS_DIR = 'src/plugins/builtin';
 const EXTERNAL_PLUGINS_DIR = 'plugins';
 // 内置插件输出到 release/（被 git 忽略，不会被 `rm -rf dist` 清掉）
 const BUILTIN_OUTPUT_DIR = 'release/plugins';
-// 外部插件输出到 plugins/{pluginId}/release/（随 plugins 目录上传 GitHub，方便小白用户下载）
-const EXTERNAL_OUTPUT_SUBDIR = 'release';
+// 外部插件 .atrd 产物直接输出到 plugins/ 根目录
+// 不用子目录（release/dist 均被 .gitignore 全局忽略）
 
 interface PluginManifest {
   id: string;
@@ -49,7 +49,7 @@ async function buildPlugin(pluginId: string): Promise<void> {
   
   // 根据插件类型确定输出目录
   const outputDir = isExternal
-    ? join(pluginDir!, EXTERNAL_OUTPUT_SUBDIR)
+    ? EXTERNAL_PLUGINS_DIR
     : BUILTIN_OUTPUT_DIR;
   
   // 1. 检查插件目录是否存在
@@ -98,7 +98,8 @@ async function buildPlugin(pluginId: string): Promise<void> {
   
   try {
     // 使用 Bun 编译 TypeScript
-    await $`bun build ${indexPath} --outfile=${pluginJsPath} --target=browser --minify-whitespace`;
+    // 保留可读格式：安装后的 plugin.js 会直接显示在应用内插件编辑器中。
+    await $`bun build ${indexPath} --outfile=${pluginJsPath} --target=browser`;
     console.log(`  ✓ Compiled to plugin.js`);
   } catch (e) {
     console.error(`❌ Failed to compile plugin:`, e);

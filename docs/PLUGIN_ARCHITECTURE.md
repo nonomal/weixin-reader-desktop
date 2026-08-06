@@ -18,7 +18,7 @@ inject.ts
       ├─ SettingsStore              前端状态、合并视图、订阅、串行 patch
       ├─ PluginLoader
       │   ├─ PluginRegistry         唯一运行时注册表
-      │   ├─ WeReadSiteRuntime      桥接冻结的 WeReadAdapter
+      │   ├─ WeReadSiteRuntime      桥接既有 WeReadAdapter
       │   └─ PluginSiteRuntime      包装外部 ReaderPlugin
       ├─ SiteContext                Managers 的唯一站点入口
       └─ Managers                   路由、菜单、样式、翻页、遥控、恢复
@@ -152,9 +152,11 @@ plugin.atrd
 - `id` 只能由小写 ASCII 字母、数字、`-`、`_` 组成，最长 64 字节。
 - Web 插件必须提供合法的 `site.domain`、HTTP(S) `homeUrl` 和非空 `readerPattern`。
 - `siteId` 永远等于 manifest 的 `id`，不能使用菜单顺序或临时编号。
+- `weread` 是内置微信读书保留 ID，外部插件不得使用；`weread.qq.com` 及其父子域名同样由内置插件保留。
+- 不同插件不得声明相同或父子重叠的域名；同一 manifest 内也不得重复声明重叠域名。
 - 外部插件必须 `export default` 一个实现 `ReaderPlugin` 的类。
 
-完整接口类型见 `src/scripts/core/plugin_types.ts`，模板见 `src/plugins/template/`，Fanqie 示例见 `plugins/fanqie/`。
+完整接口类型见 `src/scripts/core/plugin_types.ts`，模板见 `src/plugins/template/`，Fanqie 示例见 `plugins/fanqie/`。面向社区的开发步骤、能力自声明、样式组织和验收清单见 [`PLUGIN_DEVELOPMENT.md`](./PLUGIN_DEVELOPMENT.md)。
 
 ## 安装、编辑和卸载
 
@@ -167,6 +169,9 @@ Rust 在临时目录完成全部校验后才替换已安装版本：
 - 路径最多四层，拒绝绝对路径、`..`、路径穿越、非法文件名和 ZIP 符号链接。
 - 插件根目录和已安装目录必须是真实目录，规范化后仍位于应用插件根目录内。
 - 暂存版本校验失败不会覆盖旧版本；替换失败时恢复旧目录。
+- 相同外部插件 ID 必须由用户明确确认后才会整体替换；插件设置和阅读进度继续按 ID 保留。
+- `.atrd` 已注册为桌面文件类型，并显示艾特阅读图标。双击后只打开安装确认窗口，展示网站图标、身份、域名与来源文件；不会静默安装。
+- 安装确认时会再次核对清单以及当前 ID/域名冲突。
 
 ### 编辑与导出
 
@@ -174,6 +179,8 @@ Rust 在临时目录完成全部校验后才替换已安装版本：
 - 编辑器文件名必须是可移植的扁平文件名；CSS 写入插件的 `styles/` 子目录。
 - `export_plugin` 由 Rust 打开原生保存对话框并直接写入，前端不能指定任意目录。
 - 编辑器窗口只拥有加载、保存、导出和从编辑器安装插件的命令。
+- 编辑器保存后的安装包 manifest 是运行时能力开关的权威来源；加载外部插件时会覆盖代码内的默认 manifest，使插件内部与宿主读取同一份能力配置。
+- 插件管理页只负责安装、启停、编辑和卸载，不再展示与站点菜单重复的配置表单；需要暴露给用户的站内快捷操作应由插件注入匹配站点的原生界面。
 
 ### 卸载保留规则
 
@@ -192,7 +199,7 @@ Rust 在临时目录完成全部校验后才替换已安装版本：
 1. 确认调用窗口是 `main`，且当前 URL 为 HTTP(S)。
 2. 读取已安装并启用的插件。
 3. 使用 DNS label 边界匹配当前 host。
-4. 只返回唯一匹配插件的 manifest 和代码；多个匹配视为错误。
+4. 只返回唯一匹配插件的 manifest、代码和 `styles/` CSS；多个匹配视为错误。
 
 宿主不主动从网络下载插件代码。返回的代码通过 Blob 动态导入并立即撤销 Blob URL。
 
@@ -202,10 +209,11 @@ Rust 在临时目录完成全部校验后才替换已安装版本：
 
 `createPluginAPI()` 为每个插件创建命名空间：
 
-- `styles`：style ID 自动带 `plugin-<id>-` 前缀，并登记清理。
+- `style`：style ID 自动带 `plugin-<id>-` 前缀，并登记清理。
 - `events`：事件自动带 `plugin:<id>:` 前缀，订阅和 once 均登记清理。
 - `settings`：读取 `sites[id]` 与 `pluginConfigs[id]` 的合并视图。
 - `storage`：当前使用带插件前缀的 `localStorage`。
+- `style.getFile()` / `style.listFiles()`：只读访问当前插件包 `styles/` 下的 CSS；插件仍须显式决定何时注入。
 - `log`、`content`、`menu`：提供统一外观；menu 的动态注册仍是预留能力。
 
 设置字段归属：
@@ -269,7 +277,6 @@ URL 滚动位置不存进 settings：
 ```bash
 bun run build:plugin <pluginId>
 bun run build:plugin:all
-bun run check:frozen
 bun run typecheck
 bun test
 bun run check:ipc
@@ -278,7 +285,22 @@ bun run build
 
 外部插件源码优先放在 `plugins/<id>/`，构建产物位于 `plugins/<id>/release/<id>.atrd`。内置插件构建产物位于 `release/plugins/`。
 
-冻结文件清单由 `scripts/frozen-files.sha256` 维护。不要通过架构重构顺手修改微信读书进度算法、适配器、WeRead CSS、Fanqie 页面行为或插件模板页面行为；必须单独评估并更新冻结基线。
+构建产物 `plugin.js` 保留可读格式，便于在应用内「代码编辑」中直接维护；编辑器按已安装包的真实代码文件和 CSS 文件动态生成标签，避免保存不会生效的影子文件。
+
+### 插件能力自声明规范
+
+编辑器只验证开发者是否按规范声明实现位置，不判断目标网站上的功能是否真实可用。实际效果由用户使用、社区反馈和后续迭代验证。
+
+- Manifest 中以布尔值声明支持的能力。
+- 代码或 CSS 中用 `@capability <能力键>` 标出实现位置，例如 `@capability doubleColumn`。
+- 为保证 Bun 编译后的 `plugin.js` 保留代码标记，代码使用 `/*! ... */` 注释；CSS 使用普通块注释即可。
+- 不属于功能开关的基础 CSS 使用 `@foundation`。
+- 入口代码必须非空并提供默认导出；CSS 可选，但存在的 CSS 必须非空并带 `@capability` 或 `@foundation`。
+- Manifest 中开启的六项编辑器能力，必须至少在代码或样式中出现一次同名标记；该检查仅代表开发者自声明完整，不代表功能验收通过。
+
+六项能力键固定为：`doubleColumn`、`wideMode`、`hideToolbar`、`hideNavbar`、`chapterNav`、`progressTracker`。官方番茄插件和新建插件模板均遵守此规范。
+
+微信读书进度算法、适配器、WeRead CSS、Fanqie 页面行为和插件模板允许正常维护，通过针对性测试和必要的真站验收保护行为边界。
 
 ## 相关文档
 

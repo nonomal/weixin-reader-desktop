@@ -5,6 +5,7 @@ use tauri::{
 
 use crate::plugin_manager;
 use crate::settings;
+use crate::sites;
 
 /// Chrome 风格的缩放级别
 const ZOOM_LEVELS: [f64; 11] = [0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
@@ -54,69 +55,31 @@ struct PluginSiteMenuItem {
     url: String,
 }
 
-/// 站点能力（控制菜单项灰掉/可用）
-struct SiteCapabilities {
-    wide_mode: bool,
-    hide_toolbar: bool,
-    hide_navbar: bool,
-}
-
-impl SiteCapabilities {
-    /// 微信读书是根站点，全部可用
-    fn all_enabled() -> Self {
-        Self {
-            wide_mode: true,
-            hide_toolbar: true,
-            hide_navbar: true,
-        }
-    }
-}
-
-/// 获取指定站点的 capabilities。
-/// 微信读书（weread）返回全 true；外部插件从 manifest 读取。
-fn get_site_capabilities<R: Runtime>(app: &AppHandle<R>, site_id: &str) -> SiteCapabilities {
-    if site_id == "weread" {
-        return SiteCapabilities::all_enabled();
-    }
-
-    if let Ok(plugins) = plugin_manager::get_installed_plugins(app) {
-        for plugin in plugins {
-            if plugin.id == site_id {
-                if let Some(ref caps) = plugin.capabilities {
-                    return SiteCapabilities {
-                        wide_mode: caps.get("wideMode").and_then(|v| v.as_bool()).unwrap_or(false),
-                        hide_toolbar: caps.get("hideToolbar").and_then(|v| v.as_bool()).unwrap_or(false),
-                        hide_navbar: caps.get("hideNavbar").and_then(|v| v.as_bool()).unwrap_or(false),
-                    };
-                }
-            }
-        }
-    }
-
-    SiteCapabilities {
-        wide_mode: false,
-        hide_toolbar: false,
-        hide_navbar: false,
-    }
-}
-
-/// 遍历菜单树，按 capabilities 设置 reader_wide / hide_toolbar / hide_navbar 的 enabled。
-fn apply_capability_to_menu<R: Runtime>(app: &AppHandle<R>, caps: &SiteCapabilities) {
+/// 原生端不知道远程页面当前是否已经进入正文，因此创建、重建和跨站导航时
+/// 一律先禁用阅读功能。前端 MenuManager 在确认正文路由后再读取插件能力并启用。
+fn disable_reader_menu_items<R: Runtime>(app: &AppHandle<R>) {
     let Some(menu) = app.menu() else { return };
     let Ok(top_items) = menu.items() else { return };
 
     for top in top_items.iter() {
-        let Some(submenu) = top.as_submenu() else { continue };
+        let Some(submenu) = top.as_submenu() else {
+            continue;
+        };
         let is_view = submenu.text().ok().map(|t| t == "视图").unwrap_or(false);
-        if !is_view { continue }
-        let Ok(sub_items) = submenu.items() else { continue };
+        if !is_view {
+            continue;
+        }
+        let Ok(sub_items) = submenu.items() else {
+            continue;
+        };
         for item in sub_items.iter() {
             let id = item.id().as_ref();
             if let Some(check_item) = item.as_check_menuitem() {
                 match id {
-                    "reader_wide" => { let _ = check_item.set_enabled(caps.wide_mode); }
-                    "hide_toolbar" => { let _ = check_item.set_enabled(caps.hide_toolbar); }
-                    "hide_navbar" => { let _ = check_item.set_enabled(caps.hide_navbar); }
+                    "reader_wide" | "hide_cursor" | "hide_toolbar" | "hide_navbar"
+                    | "auto_flip" => {
+                        let _ = check_item.set_enabled(false);
+                    }
                     _ => {}
                 }
             }
@@ -134,7 +97,9 @@ pub fn set_edit_menu_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
     // 查找编辑菜单的位置
     let mut edit_index: Option<usize> = None;
     for (i, top) in top_items.iter().enumerate() {
-        let Some(submenu) = top.as_submenu() else { continue };
+        let Some(submenu) = top.as_submenu() else {
+            continue;
+        };
         if submenu.text().unwrap_or_default() == "编辑" {
             edit_index = Some(i);
             break;
@@ -148,15 +113,20 @@ pub fn set_edit_menu_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
         }
         (true, None) => {
             // 显示：重新创建并插入到 app_menu 之后（index=1）
-            let edit_menu = match Submenu::with_items(app, "编辑", true, &[
-                &PredefinedMenuItem::undo(app, Some("撤销")).unwrap(),
-                &PredefinedMenuItem::redo(app, Some("重做")).unwrap(),
-                &PredefinedMenuItem::separator(app).unwrap(),
-                &PredefinedMenuItem::cut(app, Some("剪切")).unwrap(),
-                &PredefinedMenuItem::copy(app, Some("拷贝")).unwrap(),
-                &PredefinedMenuItem::paste(app, Some("粘贴")).unwrap(),
-                &PredefinedMenuItem::select_all(app, Some("全选")).unwrap(),
-            ]) {
+            let edit_menu = match Submenu::with_items(
+                app,
+                "编辑",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, Some("撤销")).unwrap(),
+                    &PredefinedMenuItem::redo(app, Some("重做")).unwrap(),
+                    &PredefinedMenuItem::separator(app).unwrap(),
+                    &PredefinedMenuItem::cut(app, Some("剪切")).unwrap(),
+                    &PredefinedMenuItem::copy(app, Some("拷贝")).unwrap(),
+                    &PredefinedMenuItem::paste(app, Some("粘贴")).unwrap(),
+                    &PredefinedMenuItem::select_all(app, Some("全选")).unwrap(),
+                ],
+            ) {
                 Ok(m) => m,
                 Err(_) => return,
             };
@@ -169,16 +139,19 @@ pub fn set_edit_menu_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
 /// 获取已安装插件的网站菜单项
 fn get_plugin_site_items<R: Runtime>(handle: &tauri::AppHandle<R>) -> Vec<PluginSiteMenuItem> {
     let mut items = Vec::new();
+    let settings = settings::read_settings(handle).unwrap_or_else(|_| settings::default_settings());
 
-    // 获取外部插件
+    // 只显示当前启用的外部插件；被禁用的站点不能从菜单重新打开。
     if let Ok(plugins) = plugin_manager::get_installed_plugins(handle) {
         for plugin in plugins {
-            if let Some(site) = plugin.site {
-                items.push(PluginSiteMenuItem {
-                    id: format!("switch_site_{}", plugin.id),
-                    name: format!("{}", plugin.name),
-                    url: site.home_url,
-                });
+            if sites::is_site_enabled(&settings, &plugin.id) {
+                if let Some(site) = plugin.site {
+                    items.push(PluginSiteMenuItem {
+                        id: format!("switch_site_{}", plugin.id),
+                        name: plugin.name,
+                        url: site.home_url,
+                    });
+                }
             }
         }
     }
@@ -187,13 +160,14 @@ fn get_plugin_site_items<R: Runtime>(handle: &tauri::AppHandle<R>) -> Vec<Plugin
 }
 
 /// 构建「书店」子菜单
-/// 仅当存在至少一个外部插件站点时返回 Some;只有微信读书时返回 None(不挂菜单)
-/// 子项:微信读书(switch_site_weread) + 每个外部插件站点(switch_site_<pluginId>)
+/// 仅当存在至少一个外部插件站点时返回 Some；微信读书已禁用时不显示其菜单项。
+/// 子项: 已启用微信读书（若有）+ 每个已启用外部插件站点。
 /// 使用 CheckMenuItem，当前站点(current_site_id)前面显示对勾
 fn build_bookstore_menu<R: Runtime, M: tauri::Manager<R>>(
     manager: &M,
     plugin_sites: &[PluginSiteMenuItem],
     current_site_id: &str,
+    weread_enabled: bool,
 ) -> tauri::Result<Option<Submenu<R>>> {
     println!(
         "[Bookstore] build_bookstore_menu: current_site_id={}, plugin_sites={}",
@@ -203,15 +177,18 @@ fn build_bookstore_menu<R: Runtime, M: tauri::Manager<R>>(
     if plugin_sites.is_empty() {
         return Ok(None);
     }
-    let weread_item = CheckMenuItem::with_id(
-        manager,
-        "switch_site_weread",
-        "微信读书",
-        true,
-        current_site_id == "weread",
-        None::<&str>,
-    )?;
-    let menu = Submenu::with_items(manager, "书店", true, &[&weread_item])?;
+    let menu = Submenu::new(manager, "书店", true)?;
+    if weread_enabled {
+        let weread_item = CheckMenuItem::with_id(
+            manager,
+            "switch_site_weread",
+            "微信读书",
+            true,
+            current_site_id == "weread",
+            None::<&str>,
+        )?;
+        menu.append(&weread_item)?;
+    }
     let target_id = format!("switch_site_{}", current_site_id);
     for site in plugin_sites {
         // site.id 形如 switch_site_<pluginId>
@@ -239,23 +216,90 @@ fn current_site_id<R: Runtime>(handle: &tauri::AppHandle<R>) -> String {
         .to_string()
 }
 
+/// 切换到指定站点（菜单点击和快捷键共用）
+/// 写 lastSiteId → 更新对勾 → 禁用阅读菜单 → 导航
+pub fn switch_to_site<R: Runtime>(app: &tauri::AppHandle<R>, site_id: &str) {
+    let current = current_site_id(app);
+    let is_same_site = site_id == current;
+
+    // Rust 端直接写入 lastSiteId
+    let _ = crate::settings::update_setting(
+        app,
+        "global.lastSiteId",
+        serde_json::json!(site_id)
+    );
+
+    // 立即更新书店菜单对勾
+    let target = tauri::menu::MenuId::from(format!("switch_site_{}", site_id).as_str());
+    if let Some(menu) = app.menu() {
+        if let Ok(items) = menu.items() {
+            for top in items.iter() {
+                if let Some(submenu) = top.as_submenu() {
+                    if submenu.text().map(|t| t == "书店").unwrap_or(false) {
+                        if let Ok(sub_items) = submenu.items() {
+                            for it in sub_items.iter() {
+                                if let Some(check) = it.as_check_menuitem() {
+                                    let _ = check.set_checked(*it.id() == target);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 如果点击的就是当前站点，只更新对勾，不导航
+    if is_same_site {
+        return;
+    }
+
+    // 新页面确认进入正文前，不允许旧站点能力残留在菜单中
+    disable_reader_menu_items(app);
+
+    let settings = crate::settings::read_settings(app)
+        .unwrap_or_else(|_| crate::settings::default_settings());
+    let remember_page = settings.get("global")
+        .and_then(|g| g.get("lastPage"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let target = if remember_page {
+        settings.get("sites")
+            .and_then(|s| s.get(site_id))
+            .and_then(|s| s.get("lastReaderUrl"))
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| crate::sites::resolve_home_url(app, site_id))
+    } else {
+        crate::sites::resolve_home_url(app, site_id)
+    };
+    if let Some(url) = target {
+        if let Some(win) = app.get_webview_window("main") {
+            match url.parse::<tauri::Url>() {
+                Ok(u) => { let _ = win.navigate(u); }
+                Err(e) => eprintln!("[Bookstore] Invalid URL '{}': {:?}", url, e),
+            }
+        }
+    }
+}
+
 // Re-export monitor module functions for convenience
 #[cfg(target_os = "macos")]
 use crate::monitor::{
-    calculate_center_position, get_current_monitor_index as get_current_screen_index,
-    get_macos_display_names, start_position_monitoring,
+    get_current_monitor_index as get_current_screen_index, get_macos_display_names,
+    move_main_window_to_monitor, start_position_monitoring,
 };
 
 #[cfg(target_os = "windows")]
 use crate::monitor::{
-    calculate_center_position, get_current_monitor_index as get_current_screen_index,
-    get_display_names, start_position_monitoring,
+    get_current_monitor_index as get_current_screen_index, get_display_names,
+    move_main_window_to_monitor, start_position_monitoring,
 };
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use crate::monitor::{
-    calculate_center_position, get_current_monitor_index as get_current_screen_index,
-    get_display_names,
+    get_current_monitor_index as get_current_screen_index, get_display_names,
+    move_main_window_to_monitor,
 };
 
 /// Build menu items for available monitors (excluding current)
@@ -318,6 +362,123 @@ fn build_monitor_menu_items<R: Runtime>(
     Ok(monitor_items)
 }
 
+/// 处理菜单动作（菜单点击和前端快捷键模拟共用）
+///
+/// 背景：Windows + WebView2 下 muda 菜单 accelerator 全面失效（Edge 引擎在菜单
+/// 消息循环之前消费了所有 Ctrl 系列键盘事件），前端需要通过 keydown 监听模拟
+/// 快捷键，调用此函数复用菜单点击逻辑。
+/// macOS 上菜单 accelerator 正常工作，此函数仅供菜单点击和前端模拟调用。
+pub fn handle_menu_action<R: Runtime>(app: &AppHandle<R>, id: &str) {
+    match id {
+        "refresh" => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.eval("window.location.reload()");
+            }
+        }
+        "back" => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.eval("window.history.back()");
+            }
+        }
+        "forward" => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.eval("window.history.forward()");
+            }
+        }
+        "reader_wide" => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.emit("menu-action", "reader_wide");
+            }
+        }
+        "hide_cursor" => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.emit("menu-action", "hide_cursor");
+            }
+        }
+        "hide_toolbar" => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.emit("menu-action", "hide_toolbar");
+            }
+        }
+        "hide_navbar" => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.emit("menu-action", "hide_navbar");
+            }
+        }
+        "auto_flip" => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.emit("menu-action", "auto_flip");
+            }
+        }
+        "zoom_in" => {
+            if let Some(win) = app.get_webview_window("main") {
+                let site_id = current_site_id(app);
+                let current = get_current_zoom(app, &site_id);
+                let next = next_zoom_level(current, true);
+                let _ = win.set_zoom(next);
+                save_zoom(app, &site_id, next);
+                let pct = (next * 100.0).round() as i32;
+                let _ = win.emit("show-toast", format!("{}%", pct));
+            }
+        }
+        "zoom_out" => {
+            if let Some(win) = app.get_webview_window("main") {
+                let site_id = current_site_id(app);
+                let current = get_current_zoom(app, &site_id);
+                let next = next_zoom_level(current, false);
+                let _ = win.set_zoom(next);
+                save_zoom(app, &site_id, next);
+                let pct = (next * 100.0).round() as i32;
+                let _ = win.emit("show-toast", format!("{}%", pct));
+            }
+        }
+        "zoom_reset" => {
+            if let Some(win) = app.get_webview_window("main") {
+                let site_id = current_site_id(app);
+                let _ = win.set_zoom(1.0);
+                save_zoom(app, &site_id, 1.0);
+                let _ = win.emit("show-toast", "100%");
+            }
+        }
+        "toggle_fullscreen" => {
+            if let Some(win) = app.get_webview_window("main") {
+                if let Ok(is_fullscreen) = win.is_fullscreen() {
+                    let _ = win.set_fullscreen(!is_fullscreen);
+                    // Windows: 全屏时自动隐藏菜单栏，退出全屏时恢复
+                    #[cfg(target_os = "windows")]
+                    if !is_fullscreen {
+                        let _ = win.hide_menu();
+                        crate::commands::sync_menu_hidden_for_fullscreen(true);
+                    } else {
+                        let _ = win.show_menu();
+                        crate::commands::sync_menu_hidden_for_fullscreen(false);
+                    }
+                }
+            }
+        }
+        "settings" => {
+            // 通过 simulate_menu_click（前端 invoke）调用时，WebView2 正在处理
+            // keydown 事件，直接在此创建新窗口会死锁。放到 async_runtime 的下一轮
+            // 执行，让 WebView2 先完成 keydown 处理。菜单点击路径不受影响（同步调用
+            // 时 spawn 也能正常工作，只是延后了一轮事件循环）。
+            let app_clone = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(win) = app_clone.get_webview_window("settings") {
+                    let _ = win.set_focus();
+                } else {
+                     let _ = WebviewWindowBuilder::new(&app_clone, "settings", WebviewUrl::App("settings.html".into()))
+                        .title("设置")
+                        .inner_size(720.0, 600.0)
+                        .center()
+                        .resizable(false)
+                        .build();
+                }
+            });
+        }
+        _ => {}
+    }
+}
+
 /// Rebuild the entire menu (called after window moves)
 /// This recreates the menu with updated monitor items based on current window position
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -337,6 +498,7 @@ pub fn rebuild_full_menu<R: Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Res
     // macOS-only: App Menu with hide/show items
     #[cfg(target_os = "macos")]
     let app_menu = {
+        let stealth = MenuItem::with_id(handle, "stealth", "摸鱼", true, Some("CmdOrCtrl+`"))?;
         let hide = PredefinedMenuItem::hide(handle, Some("隐藏"))?;
         let hide_others = PredefinedMenuItem::hide_others(handle, Some("隐藏其他"))?;
         let show_all = PredefinedMenuItem::show_all(handle, Some("显示全部"))?;
@@ -351,6 +513,7 @@ pub fn rebuild_full_menu<R: Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Res
                 &PredefinedMenuItem::separator(handle)?,
                 &settings,
                 &PredefinedMenuItem::separator(handle)?,
+                &stealth,
                 &hide,
                 &hide_others,
                 &show_all,
@@ -360,13 +523,20 @@ pub fn rebuild_full_menu<R: Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Res
         )?
     };
 
-    // Windows: File Menu (settings, quit)
+    // Windows: File Menu (stealth, toggle menu bar, settings, quit)
     #[cfg(target_os = "windows")]
     let file_menu = Submenu::with_items(
         handle,
         "文件",
         true,
-        &[&settings, &PredefinedMenuItem::separator(handle)?, &quit],
+        &[
+            &settings,
+            &PredefinedMenuItem::separator(handle)?,
+            &MenuItem::with_id(handle, "toggle_menu", "隐藏菜单\tCtrl+H", true, None::<&str>)?,
+            &MenuItem::with_id(handle, "stealth", "摸鱼", true, Some("CmdOrCtrl+`"))?,
+            &PredefinedMenuItem::separator(handle)?,
+            &quit,
+        ],
     )?;
 
     // View Menu (same for all platforms)
@@ -470,7 +640,13 @@ pub fn rebuild_full_menu<R: Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Res
 
     // 书店菜单（仅当存在外部插件站点时出现）
     let plugin_sites = get_plugin_site_items(handle);
-    let bookstore_menu = build_bookstore_menu(handle, &plugin_sites, &current_site_id(handle))?;
+    let settings = settings::read_settings(handle).unwrap_or_else(|_| settings::default_settings());
+    let bookstore_menu = build_bookstore_menu(
+        handle,
+        &plugin_sites,
+        &current_site_id(handle),
+        sites::is_site_enabled(&settings, sites::WEREAD.id),
+    )?;
 
     // Windows: Help menu = About + Check Update（站点切换已移至「书店」菜单）
     #[cfg(target_os = "windows")]
@@ -500,9 +676,8 @@ pub fn rebuild_full_menu<R: Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Res
 
     handle.set_menu(menu)?;
 
-    // 按当前站点 capabilities 灰掉不适用的菜单项
-    let caps = get_site_capabilities(handle, &current_site_id(handle));
-    apply_capability_to_menu(handle, &caps);
+    // 等正文路由确认后由前端根据插件能力恢复可用项。
+    disable_reader_menu_items(handle);
 
     eprintln!("DEBUG: Menu rebuilt successfully");
 
@@ -537,6 +712,7 @@ pub fn init<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
     // macOS: App Menu with hide/show items
     #[cfg(target_os = "macos")]
     let app_menu = {
+        let stealth = MenuItem::with_id(handle, "stealth", "摸鱼", true, Some("CmdOrCtrl+`"))?;
         let hide = PredefinedMenuItem::hide(handle, Some("隐藏"))?;
         let hide_others = PredefinedMenuItem::hide_others(handle, Some("隐藏其他"))?;
         let show_all = PredefinedMenuItem::show_all(handle, Some("显示全部"))?;
@@ -551,6 +727,7 @@ pub fn init<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
                 &PredefinedMenuItem::separator(handle)?,
                 &settings,
                 &PredefinedMenuItem::separator(handle)?,
+                &stealth,
                 &hide,
                 &hide_others,
                 &show_all,
@@ -566,7 +743,14 @@ pub fn init<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
         handle,
         "文件",
         true,
-        &[&settings, &PredefinedMenuItem::separator(handle)?, &quit],
+        &[
+            &settings,
+            &PredefinedMenuItem::separator(handle)?,
+            &MenuItem::with_id(handle, "toggle_menu", "隐藏菜单\tCtrl+H", true, None::<&str>)?,
+            &MenuItem::with_id(handle, "stealth", "摸鱼", true, Some("CmdOrCtrl+`"))?,
+            &PredefinedMenuItem::separator(handle)?,
+            &quit,
+        ],
     )?;
 
     // Manage menu state for updates
@@ -684,7 +868,13 @@ pub fn init<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
 
     // 书店菜单（仅当存在外部插件站点时出现）
     let plugin_sites = get_plugin_site_items(handle);
-    let bookstore_menu = build_bookstore_menu(handle, &plugin_sites, &current_site_id(handle))?;
+    let settings = settings::read_settings(handle).unwrap_or_else(|_| settings::default_settings());
+    let bookstore_menu = build_bookstore_menu(
+        handle,
+        &plugin_sites,
+        &current_site_id(handle),
+        sites::is_site_enabled(&settings, sites::WEREAD.id),
+    )?;
 
     // Windows/Linux: Help menu = About + Check Update（站点切换已移至「书店」菜单）
     #[cfg(not(target_os = "macos"))]
@@ -732,92 +922,20 @@ pub fn init<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
 
     app.set_menu(menu)?;
 
-    // 按当前站点 capabilities 灰掉不适用的菜单项
-    let caps = get_site_capabilities(handle, &current_site_id(handle));
-    apply_capability_to_menu(handle, &caps);
+    // 启动时远程页面可能仍在首页，先保持所有阅读功能禁用。
+    disable_reader_menu_items(handle);
 
     // Event Handling - use handle for move closure
     let handle_for_events = handle.clone();
     app.on_menu_event(move |app, event| {
         let id = event.id.as_ref();
         match id {
-            "refresh" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.eval("window.location.reload()");
-                }
-            }
-            "back" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.eval("window.history.back()");
-                }
-            }
-            "forward" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.eval("window.history.forward()");
-                }
-            }
-            "reader_wide" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.emit("menu-action", "reader_wide");
-                }
-            }
-            "hide_cursor" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.emit("menu-action", "hide_cursor");
-                }
-            }
-            "hide_toolbar" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.emit("menu-action", "hide_toolbar");
-                }
-            }
-            "hide_navbar" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.emit("menu-action", "hide_navbar");
-                }
-            }
-            "auto_flip" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.emit("menu-action", "auto_flip");
-                }
-            }
-            "zoom_in" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let site_id = current_site_id(&app);
-                    let current = get_current_zoom(&app, &site_id);
-                    let next = next_zoom_level(current, true);
-                    let _ = win.set_zoom(next);
-                    save_zoom(&app, &site_id, next);
-                    let pct = (next * 100.0).round() as i32;
-                    let _ = win.emit("show-toast", format!("{}%", pct));
-                }
-            }
-            "zoom_out" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let site_id = current_site_id(&app);
-                    let current = get_current_zoom(&app, &site_id);
-                    let next = next_zoom_level(current, false);
-                    let _ = win.set_zoom(next);
-                    save_zoom(&app, &site_id, next);
-                    let pct = (next * 100.0).round() as i32;
-                    let _ = win.emit("show-toast", format!("{}%", pct));
-                }
-            }
-            "zoom_reset" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let site_id = current_site_id(&app);
-                    let _ = win.set_zoom(1.0);
-                    save_zoom(&app, &site_id, 1.0);
-                    let _ = win.emit("show-toast", "100%");
-                }
-            }
-            "toggle_fullscreen" => {
-                // Windows/Linux: Toggle fullscreen manually
-                if let Some(win) = app.get_webview_window("main") {
-                    if let Ok(is_fullscreen) = win.is_fullscreen() {
-                        let _ = win.set_fullscreen(!is_fullscreen);
-                    }
-                }
+            // 以下动作已提取到 handle_menu_action，供菜单点击和前端快捷键模拟共用
+            "refresh" | "back" | "forward" | "reader_wide" | "hide_cursor"
+            | "hide_toolbar" | "hide_navbar" | "auto_flip"
+            | "zoom_in" | "zoom_out" | "zoom_reset"
+            | "toggle_fullscreen" | "settings" => {
+                handle_menu_action(app, id);
             }
             "about" => {
                 // Open settings window and navigate to about section
@@ -860,17 +978,11 @@ pub fn init<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
                     }
                 }
             }
-            "settings" => {
-                if let Some(win) = app.get_webview_window("settings") {
-                    let _ = win.set_focus();
-                } else {
-                     let _ = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
-                        .title("设置")
-                        .inner_size(720.0, 600.0)
-                        .center()
-                        .resizable(false)
-                        .build();
-                }
+            "stealth" => {
+                crate::commands::toggle_stealth(app.clone());
+            }
+            "toggle_menu" => {
+                crate::commands::toggle_menu_bar(app.clone());
             }
             "quit" => {
                 // Clear autoFlip.active before quitting
@@ -888,78 +1000,10 @@ pub fn init<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
                 std::process::exit(0);
             }
             _ => {
-                // 书店站点切换：站内导航主 webview
-                // 手动切换始终续读该站点上次阅读页（不受「记住书店」开关限制）；
-                // 不在此写 settings，lastSiteId 由前端单写，避免双写互盖
+                // 书店站点切换：菜单点击和快捷键共用 switch_to_site
                 if id.starts_with("switch_site_") {
                     if let Some(site_id) = id.strip_prefix("switch_site_") {
-                        // 判断是否点击的就是当前站点
-                        let current = current_site_id(app);
-                        let is_same_site = site_id == current;
-
-                        // Rust 端直接写入 lastSiteId
-                    let _ = crate::settings::update_setting(
-                            &app,
-                            "global.lastSiteId",
-                            serde_json::json!(site_id)
-                        );
-
-                        // 立即更新书店菜单对勾（遍历菜单项，只勾选目标站点）
-                        let target = tauri::menu::MenuId::from(format!("switch_site_{}", site_id).as_str());
-                        if let Some(menu) = app.menu() {
-                            if let Ok(items) = menu.items() {
-                                for top in items.iter() {
-                                    if let Some(submenu) = top.as_submenu() {
-                                        if submenu.text().map(|t| t == "书店").unwrap_or(false) {
-                                            if let Ok(sub_items) = submenu.items() {
-                                                for it in sub_items.iter() {
-                                                    if let Some(check) = it.as_check_menuitem() {
-                                                        let _ = check.set_checked(*it.id() == target);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // 按目标站点 capabilities 灰掉不适用的菜单项
-                        let caps = get_site_capabilities(app, site_id);
-                        apply_capability_to_menu(app, &caps);
-
-                        // 如果点击的就是当前站点，只更新对勾和 capabilities，不导航
-                        if is_same_site {
-                            return;
-                        }
-
-                        let settings = crate::settings::read_settings(app)
-                            .unwrap_or_else(|_| crate::settings::default_settings());
-                        // 与启动逻辑一致：受 global.lastPage 开关控制
-                        // 开 → 跳上次阅读页；关 → 跳站点首页
-                        let remember_page = settings.get("global")
-                            .and_then(|g| g.get("lastPage"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
-                        let target = if remember_page {
-                            settings.get("sites")
-                                .and_then(|s| s.get(site_id))
-                                .and_then(|s| s.get("lastReaderUrl"))
-                                .and_then(|u| u.as_str())
-                                .map(|s| s.to_string())
-                                .or_else(|| crate::sites::resolve_home_url(app, site_id))
-                        } else {
-                            crate::sites::resolve_home_url(app, site_id)
-                        };
-                        if let Some(url) = target {
-                            if let Some(win) = app.get_webview_window("main") {
-                                // 只导航，zoom 由前端注入脚本在新页面初始化时设置
-                                match url.parse::<tauri::Url>() {
-                                    Ok(u) => { let _ = win.navigate(u); }
-                                    Err(e) => eprintln!("[Bookstore] Invalid URL '{}': {:?}", url, e),
-                                }
-                            }
-                        }
+                        switch_to_site(app, site_id);
                     }
                     return;
                 }
@@ -978,28 +1022,8 @@ pub fn init<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
                                 return;
                             }
 
-                            // Get window size and calculate center position
-                            if let Some(win) = app.get_webview_window("main") {
-                                if let Ok(current_size) = win.outer_size() {
-                                    if let Some((x, y)) = calculate_center_position(
-                                        index,
-                                        (current_size.width, current_size.height),
-                                        app,
-                                    ) {
-                                        eprintln!("DEBUG: Moving window to ({}, {}) on monitor[{}]", x, y, index);
-                                        let _ = win.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x as f64, y as f64)));
-
-                                        // Rebuild menu after window move
-                                        // Wait a bit for the window to actually move
-                                        let app_clone = app.clone();
-                                        std::thread::spawn(move || {
-                                            std::thread::sleep(std::time::Duration::from_millis(200));
-                                            if let Err(e) = rebuild_full_menu(&app_clone) {
-                                                eprintln!("DEBUG: Failed to rebuild menu: {:?}", e);
-                                            }
-                                        });
-                                    }
-                                }
+                            if let Err(error) = move_main_window_to_monitor(app, index) {
+                                eprintln!("[Monitor] Failed to move main window: {error}");
                             }
                         }
                     }
@@ -1165,7 +1189,7 @@ mod tests {
     #[test]
     fn bookstore_menu_is_absent_without_external_sites() {
         let app = tauri::test::mock_app();
-        let menu = build_bookstore_menu(app.handle(), &[], "weread").unwrap();
+        let menu = build_bookstore_menu(app.handle(), &[], "weread", true).unwrap();
         assert!(menu.is_none());
     }
 }

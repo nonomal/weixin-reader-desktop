@@ -5,14 +5,16 @@
 ### 🚀 基于 Tauri v2 + Rust 的高性能微信读书桌面客户端
 
 <p>
-  <a href="https://github.com/dengcb/weixin-reader-desktop/releases"><img src="https://img.shields.io/badge/release-v1.1.0-orange?style=flat-square" alt="Release"></a>
+  <a href="https://github.com/dengcb/weixin-reader-desktop/releases"><img src="https://img.shields.io/badge/release-v1.4.0-orange?style=flat-square" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/github/downloads/dengcb/weixin-reader-desktop/total?style=flat-square&color=green" alt="Downloads">
   <img src="https://img.shields.io/badge/Tauri-v2-24C8D5?style=flat-square&logo=tauri&logoColor=white" alt="Tauri">
-  <img src="https://img.shields.io/badge/Platform-macOS-000000?style=flat-square&logo=apple&logoColor=white" alt="Platform">
+  <img src="https://img.shields.io/badge/Platform-macOS-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/Windows-0078D4?style=flat-square" alt="Windows">
 </p>
 
 <p>
+  <a href="https://reader.dengcb.com">官方主页</a> •
   <a href="#-选择理由">选择理由</a> •
   <a href="#-核心特性">核心特性</a> •
   <a href="#-快速开始">快速开始</a> •
@@ -74,7 +76,7 @@ CPU 占用低
 
 ## ✨ 核心特性
 
-### 🖥️ 桌面体验
+### 🖥 桌面体验
 
 ```
 ✓ macOS 原生菜单栏            ✓ 窗口位置/大小记忆
@@ -102,8 +104,8 @@ CPU 占用低
 </td>
 <td>
 
-**⌨️ 翻页控制**
-- 🖱️ 触摸板双指滑动
+**⌨ 翻页控制**
+- 🖱 触摸板双指滑动
 - ⚡ 自动翻页（可调速）
 - 👻 鼠标自动隐藏
 - 🎯 精准进度显示
@@ -123,7 +125,7 @@ CPU 占用低
 ✓ 插件级命名空间隔离             ✓ 配置命名空间与独立阅读位置
 ```
 
-### 🛠️ 可视化插件编辑器 <sup>v0.9.0 新增</sup>
+### 🛠 可视化插件编辑器 <sup>v0.9.0 新增</sup>
 
 > 内置插件开发工具，无需外部 IDE 即可创建和编辑插件
 
@@ -184,84 +186,56 @@ CPU 占用低
 
 <table>
 <tr>
-<th width="40%">芯片类型</th>
+<th width="40%">平台 / 芯片</th>
 <th width="60%">下载文件</th>
 </tr>
 <tr>
-<td>🍎 Apple Silicon (M1/M2/M3/M4)</td>
-<td><code>weixin-reader_x.x.x_aarch64.dmg</code></td>
+<td>🍎 macOS Apple Silicon (M1/M2/M3/M4)</td>
+<td><code>weixin-reader-x.x.x-macos-aarch64.dmg</code></td>
 </tr>
 <tr>
-<td>💻 Intel</td>
-<td><code>weixin-reader_x.x.x_x64.dmg</code></td>
+<td>💻 macOS Intel</td>
+<td><code>weixin-reader-x.x.x-macos-x86_64.dmg</code></td>
+</tr>
+<tr>
+<td>🪟 Windows x64 (Intel/AMD)</td>
+<td><code>weixin-reader-x.x.x-windows-x86_64-setup.exe</code></td>
+</tr>
+<tr>
+<td>🪟 Windows ARM64 (Snapdragon X)</td>
+<td><code>weixin-reader-x.x.x-windows-aarch64-setup.exe</code></td>
 </tr>
 </table>
 
-### 🔨 从源码构建
+### 🪟 Windows 构建
+
+正式版本通过 GitHub Actions 原生 runner 构建 x64 和 ARM64 两个 NSIS 安装包。需要自行打包的 Windows 开发者，在对应架构的 Windows 环境运行：
 
 ```bash
-# 1. 克隆仓库
-git clone https://github.com/dengcb/weixin-reader-desktop.git
-cd weixin-reader-desktop
-
-# 2. 安装依赖
-bun install
-
-# 3. 构建发布版本
-bun release:arm    # Apple Silicon
-bun release:intel  # Intel
-```
-
-### 🪟 Windows 构建（在 macOS 上交叉编译）
-
-```bash
-# 1. 首次安装（仅需一次）
-brew install llvm
-cargo install cargo-xwin
-rustup target add x86_64-pc-windows-msvc
-
-# 2. 构建
-export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
-bun run build
-cargo xwin build --release --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml
-
-# 产物: src-tauri/target/x86_64-pc-windows-msvc/release/weixin-reader.exe (~7MB)
+bun install --frozen-lockfile
+# x64（Intel/AMD）
+bun run tauri build --bundles nsis --target x86_64-pc-windows-msvc -- --locked
+# ARM64（Snapdragon X 等）
+bun run tauri build --bundles nsis --target aarch64-pc-windows-msvc -- --locked
 ```
 
 ---
 
-## 🛠️ 开发指南
+## 🛠 开发指南
 
 ### 📋 环境准备
 
-<table>
-<tr>
-<td width="50%">
+需要 [Rust](https://rustup.rs/) 和 [Bun](https://bun.sh/)：
 
-**安装 Rust**
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf \
-  https://sh.rustup.rs | sh
+git clone https://github.com/dengcb/weixin-reader-desktop.git
+cd weixin-reader-desktop
+bun install
 ```
-
-</td>
-<td width="50%">
-
-**安装 Bun**
-```bash
-curl -fsSL https://bun.sh/install | bash
-```
-
-</td>
-</tr>
-</table>
 
 ### ⚡ 开发命令
 
 ```bash
-# 安装依赖
-bun install
-
 # 🚀 启动开发模式（热重载 + 自动同步版本）
 bun start
 
@@ -283,55 +257,28 @@ bun run debug:intel  # Intel
 ### 📤 发布打包
 
 ```bash
-bun release:all    # 构建所有架构
-bun release:arm    # Apple Silicon
-bun release:intel  # Intel
-bun release:clear  # 清理发布文件
+bun run release:all      # 正式构建 macOS ARM + Intel，生成发布元数据
+bun run release:upload   # 创建 tag/draft、上传 macOS、触发 Windows x64 + ARM64 workflow
+bun run release:status   # 查看 Windows workflow、资产、SHA-256 和 Authenticode
+bun run release:publish  # 校验全部平台、生成 latest.json、输入完整 tag 后发布
+
+bun run release:arm      # 单架构诊断构建，不能直接正式上传
+bun run release:intel    # 单架构诊断构建，不能直接正式上传
+bun run release:clear    # 清理本地发布文件
 ```
 
 ### ✅ 测试
 
-<table>
-<tr>
-<td width="50%">
-
-**Rust 后端测试**
 ```bash
-cargo test --manifest-path src-tauri/Cargo.toml
+bun test                                    # TypeScript 前端
+cargo test --manifest-path src-tauri/Cargo.toml  # Rust 后端
 ```
 
-</td>
-<td width="50%">
-
-**TypeScript 前端测试**
-```bash
-bun test
-```
-
-</td>
-</tr>
-</table>
-
-完整质量门禁：
-
-```bash
-bun run check:frozen  # 受保护的站点实现与样式
-bun run typecheck     # 严格 TypeScript 检查
-bun test              # Bun + happy-dom
-bun run check:ipc     # Rust handler / capability / permission 一致性
-bun run build         # 重新生成 inject.js 与 dist
-cargo fmt --manifest-path src-tauri/Cargo.toml --check
-cargo test --manifest-path src-tauri/Cargo.toml
-cargo check --manifest-path src-tauri/Cargo.toml
-bun run test:e2e      # Playwright 模拟 E2E
-git diff --check
-```
-
-截至 2026-08-02：Bun 242 项通过；Rust 64 项通过、1 项真机显示器测试显式忽略；模拟 E2E 6 项通过。
+CI 在每次 push 时自动执行完整的质量门禁（typecheck + test + build + IPC 检查 + inject.js 一致性校验）。
 
 ---
 
-## 🏗️ 技术架构
+## 🏗 技术架构
 
 ### 📚 技术栈
 
@@ -475,7 +422,7 @@ git diff --check
 </tr>
 <tr>
 <td><code>monitor.rs</code></td>
-<td>🖥️ 多显示器支持，事件驱动检测</td>
+<td>🖥 多显示器支持，事件驱动检测</td>
 </tr>
 <tr>
 <td><code>plugin_manager.rs</code></td>
@@ -509,15 +456,17 @@ tauri-plugin-updater       → GitHub Release 更新检查、下载与重启安�
 
 ## 📖 文档
 
-- 🏗️ [插件与站点架构](docs/PLUGIN_ARCHITECTURE.md) - `ReaderSiteRuntime`、插件运行时与开发约束
+- 🔌 [第三方插件开发指南](docs/PLUGIN_DEVELOPMENT.md) - Manifest、自声明规范、代码与样式组织、构建测试和社区验收
+- 🏗 [插件与站点架构](docs/PLUGIN_ARCHITECTURE.md) - `ReaderSiteRuntime`、插件运行时与开发约束
 - 🔁 [事件与生命周期](docs/EVENT_BUS_REFACTOR.md) - EventBus、BaseManager 与资源清理规范
 - 🔐 [Tauri 2.11 与 IPC](docs/TAURI_2_11_UPGRADE.md) - Capability 拆分和命令一致性规则
-- 🧪 [测试指南](docs/TESTING.md) - 当前测试结构与完整质量门禁
+- 🧪 [测试指南](docs/TESTING.md) - 当前测试结构与必要质量门禁
+- ✍️ [Code signing policy](docs/CODE_SIGNING_POLICY.md) - Windows 签名角色、来源与发布约束
 - 📘 [2026 架构重构记录](docs/ARCHITECTURE_REFACTOR_2026.md) - 本次重构的动机、改动和兼容边界
 
 ---
 
-## ⚠️ 免责声明
+## ⚠ 免责声明
 
 > 本项目仅为个人学习和使用的第三方客户端，与腾讯公司及微信读书团队无任何关联
 
@@ -540,7 +489,7 @@ tauri-plugin-updater       → GitHub Release 更新检查、下载与重启安�
 </td>
 <td align="center">
 
-### 🗄️ 数据来源
+### 🗄 数据来源
 
 所有内容均通过官方接口<br>
 **weread.qq.com**<br>
@@ -571,8 +520,8 @@ tauri-plugin-updater       → GitHub Release 更新检查、下载与重启安�
 
 <div align="center">
 
-**Built with ❤️ using Rust & Tauri**
+**Built with ❤ using Rust & Tauri**
 
-<sub>如果这个项目对你有帮助，请给个 ⭐️ Star 支持一下！</sub>
+<sub>如果这个项目对你有帮助，请给个 ⭐ Star 支持一下！</sub>
 
 </div>

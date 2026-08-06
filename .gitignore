@@ -38,7 +38,9 @@ node_modules
 dist
 dist-ssr
 *.local
-.github
+.github/*
+!.github/workflows/
+!.github/workflows/*.yml
 release
 
 # Editor directories and files
@@ -62,3 +64,6 @@ CLAUDE.md
 
 # Test
 test-*.js
+
+#worktree for Github Pages
+site/

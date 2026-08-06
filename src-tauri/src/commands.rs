@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewWindow};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 摸鱼模式状态：true = 当前隐藏中
+static STEALTH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+static EDITOR_INSTALL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[tauri::command]
 pub fn log_to_file(_app: AppHandle, message: String) {
@@ -14,7 +20,7 @@ pub fn update_menu_state(app: AppHandle, id: String, state: bool) {
             if let Some(view_submenu) = items.get(1).and_then(|i| i.as_submenu()) {
                 if let Ok(sub_items) = view_submenu.items() {
                     for sub_item in sub_items.iter() {
-                        if *sub_item.id() == tauri::menu::MenuId::from(id.as_str()) {
+                        if sub_item.id() == id.as_str() {
                             if let Some(check_item) = sub_item.as_check_menuitem() {
                                 let _ = check_item.set_checked(state);
                                 return;
@@ -36,7 +42,7 @@ pub fn set_menu_item_enabled(app: AppHandle, id: String, enabled: bool) {
                 if let Some(submenu) = menu_item.as_submenu() {
                     if let Ok(sub_items) = submenu.items() {
                         for sub_item in sub_items.iter() {
-                            if *sub_item.id() == tauri::menu::MenuId::from(id.as_str()) {
+                            if sub_item.id() == id.as_str() {
                                 if let Some(check_item) = sub_item.as_check_menuitem() {
                                     let _ = check_item.set_enabled(enabled);
                                 } else if let Some(menu_item_inner) = sub_item.as_menuitem() {
@@ -108,6 +114,95 @@ pub fn set_title(window: WebviewWindow, title: String) {
     let _ = window.set_title(&title);
 }
 
+/// 摸鱼键：切换窗口可见性
+/// 隐藏时：窗口不可见 + Windows 任务栏图标隐藏
+/// 恢复时：窗口可见 + 任务栏图标恢复 + 窗口获取焦点
+#[tauri::command]
+pub fn toggle_stealth<R: Runtime>(app: AppHandle<R>) {
+    let Some(win) = app.get_webview_window("main") else { return };
+
+    let was_hidden = STEALTH_ACTIVE.swap(true, Ordering::SeqCst);
+    if was_hidden {
+        // 当前是隐藏状态 → 恢复显示
+        #[cfg(target_os = "windows")]
+        let _ = win.set_skip_taskbar(false);
+        let _ = win.show();
+        let _ = win.set_focus();
+        STEALTH_ACTIVE.store(false, Ordering::SeqCst);
+    } else {
+        // 当前可见 → 隐藏
+        let _ = win.hide();
+        #[cfg(target_os = "windows")]
+        let _ = win.set_skip_taskbar(true);
+    }
+}
+
+/// Windows 专属：切换菜单栏可见性（Ctrl+M）
+/// 不持久化，重启后恢复默认显示
+#[cfg(target_os = "windows")]
+static MENU_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+pub fn toggle_menu_bar<R: Runtime>(app: AppHandle<R>) {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(win) = app.get_webview_window("main") else { return };
+        let was_hidden = MENU_HIDDEN.swap(true, Ordering::SeqCst);
+        if was_hidden {
+            let _ = win.show_menu();
+            MENU_HIDDEN.store(false, Ordering::SeqCst);
+        } else {
+            let _ = win.hide_menu();
+        }
+    }
+    // 非 Windows 平台：空操作（macOS/Linux 菜单行为不同，不需要隐藏）
+    #[cfg(not(target_os = "windows"))]
+    let _ = app;
+}
+
+/// Windows 专属：全屏切换时同步菜单栏状态（menu.rs 调用）
+/// 全屏自动隐藏菜单时标记为 hidden，退出全屏自动恢复时标记为 visible，
+/// 确保 toggle_menu_bar 的原子状态与实际菜单状态一致。
+#[cfg(target_os = "windows")]
+pub fn sync_menu_hidden_for_fullscreen(hidden: bool) {
+    MENU_HIDDEN.store(hidden, Ordering::SeqCst);
+}
+
+/// 模拟菜单点击（Windows"瞒天过海"快捷键方案）
+///
+/// 背景：Windows + WebView2 下 muda 菜单 accelerator 全面失效，Edge 引擎在
+/// 菜单消息循环之前消费了所有 Ctrl 系列键盘事件。前端 keydown 监听捕获后
+/// 调用此命令，复用菜单点击逻辑，用户感知不到差异。
+/// macOS 上菜单 accelerator 正常工作，此命令仅供前端模拟调用。
+#[tauri::command]
+pub fn simulate_menu_click<R: Runtime>(app: AppHandle<R>, action: String) {
+    crate::menu::handle_menu_action(&app, &action);
+}
+
+/// 书店快捷键：按序号切换书店（1=微信读书，2=第一个插件站点，依此类推）
+#[tauri::command]
+pub fn switch_bookstore_by_index<R: Runtime>(app: AppHandle<R>, index: u8) {
+    let settings = crate::settings::read_settings(&app)
+        .unwrap_or_else(|_| crate::settings::default_settings());
+    let mut site_ids = Vec::new();
+    if crate::sites::is_site_enabled(&settings, crate::sites::WEREAD.id) {
+        site_ids.push(crate::sites::WEREAD.id.to_string());
+    }
+    if let Ok(plugins) = crate::plugin_manager::get_installed_plugins(&app) {
+        for plugin in plugins {
+            if plugin.site.is_some() && crate::sites::is_site_enabled(&settings, &plugin.id) {
+                site_ids.push(plugin.id);
+            }
+        }
+    }
+    // index 从 1 开始，转为 0-based
+    if index >= 1 {
+        if let Some(site_id) = site_ids.get((index - 1) as usize) {
+            crate::menu::switch_to_site(&app, site_id);
+        }
+    }
+}
+
 /// 前端注入脚本初始化完成时调用，通知 Rust 端按当前站点应用缩放
 #[tauri::command]
 pub fn apply_site_zoom(app: AppHandle, site_id: String) {
@@ -143,7 +238,7 @@ use crate::plugin_manager;
 
 /// 插件变更后重建应用菜单（使「书店」菜单随外部插件增减即时出现/消失）
 /// rebuild_full_menu 仅在 macOS/Windows 存在，其它平台为空操作
-fn refresh_app_menu(app: &AppHandle) {
+pub(crate) fn refresh_app_menu(app: &AppHandle) {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         if let Err(e) = crate::menu::rebuild_full_menu(app) {
@@ -154,48 +249,80 @@ fn refresh_app_menu(app: &AppHandle) {
     let _ = app;
 }
 
+pub(crate) fn enable_plugin_in_settings(app: &AppHandle, plugin_id: &str) -> Result<(), String> {
+    let settings = crate::settings::read_settings(app)?;
+    let Some(enabled) = settings
+        .get("global")
+        .and_then(|global| global.get("enabledPlugins"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        // 列表缺省表示所有插件启用，保持向后兼容。
+        return Ok(());
+    };
+    if enabled
+        .iter()
+        .any(|value| value.as_str() == Some(plugin_id))
+    {
+        return Ok(());
+    }
+    let mut next = enabled.clone();
+    next.push(serde_json::Value::String(plugin_id.to_string()));
+    crate::settings::update_setting(app, "global.enabledPlugins", serde_json::Value::Array(next))?;
+    Ok(())
+}
+
 /// 安装插件
+fn confirm_plugin_replacement(
+    app: &AppHandle,
+    candidate: &plugin_manager::PluginInfo,
+    conflicts: &[plugin_manager::PluginInstallConflict],
+) -> Result<(), String> {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+    let Some(existing) = conflicts
+        .iter()
+        .find(|conflict| conflict.kind == "existing-id")
+    else {
+        return Ok(());
+    };
+    let name = existing.existing_name.as_deref().unwrap_or("现有插件");
+    let version = existing.existing_version.as_deref().unwrap_or("未知版本");
+    let message = format!(
+        "已安装「{name}」v{version}。\n即将安装「{}」v{}。\n\n无论版本高低，继续安装都会完整覆盖现有插件文件；插件设置和阅读进度会按 ID 保留。是否继续？",
+        candidate.name, candidate.version
+    );
+    let confirmed = app
+        .dialog()
+        .message(&message)
+        .title("插件 ID 已存在")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "覆盖并安装".to_string(),
+            "取消".to_string(),
+        ))
+        .kind(MessageDialogKind::Warning)
+        .blocking_show_with_result();
+    if confirmed == tauri_plugin_dialog::MessageDialogResult::Ok {
+        Ok(())
+    } else {
+        Err("用户取消安装".to_string())
+    }
+}
+
 #[tauri::command]
 pub async fn install_plugin(
     app: AppHandle,
     path: String,
 ) -> Result<plugin_manager::PluginInfo, String> {
-    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-
     println!("[Plugin] Installing plugin from: {}", path);
 
     // 在询问覆盖前完成体积、路径、文件数和 manifest 校验。
     let manifest = plugin_manager::inspect_plugin_package(&path)?;
-
-    // 检查是否已存在同名 ID 的插件
-    let existing_plugin = plugin_manager::get_installed_plugins(&app)
-        .ok()
-        .and_then(|plugins| plugins.into_iter().find(|p| p.id == manifest.id));
-
-    if let Some(existing) = existing_plugin {
-        // 弹出确认对话框
-        let message = format!(
-            "已安装「{}」插件，继续安装将覆盖现有版本。\n\n是否继续？",
-            existing.name
-        );
-
-        let confirmed = app
-            .dialog()
-            .message(&message)
-            .title("插件已存在")
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                "继续安装".to_string(),
-                "取消".to_string(),
-            ))
-            .kind(MessageDialogKind::Warning)
-            .blocking_show_with_result();
-
-        if confirmed != tauri_plugin_dialog::MessageDialogResult::Ok {
-            return Err("用户取消安装".to_string());
-        }
-    }
+    let conflicts = plugin_manager::get_install_conflicts(&app, &manifest)?;
+    plugin_manager::reject_blocking_install_conflicts(&conflicts)?;
+    confirm_plugin_replacement(&app, &manifest, &conflicts)?;
 
     let result = plugin_manager::install_plugin_from_file(&app, &path)?;
+    enable_plugin_in_settings(&app, &result.id)?;
     println!(
         "[Plugin] Plugin installed: {} v{}",
         result.id, result.version
@@ -291,6 +418,7 @@ pub async fn get_installed_plugins(
 pub struct RuntimePlugin {
     pub plugin: plugin_manager::PluginInfo,
     pub code: String,
+    pub styles: std::collections::BTreeMap<String, String>,
 }
 
 fn manifest_matches_host(plugin: &plugin_manager::PluginInfo, host: &str) -> bool {
@@ -336,7 +464,12 @@ pub async fn get_runtime_plugin<R: Runtime>(
         return Ok(None);
     };
     let code = plugin_manager::get_plugin_code(&app, &plugin.id)?;
-    Ok(Some(RuntimePlugin { plugin, code }))
+    let styles = plugin_manager::get_plugin_styles(&app, &plugin.id)?;
+    Ok(Some(RuntimePlugin {
+        plugin,
+        code,
+        styles,
+    }))
 }
 
 // ==================== 插件编辑器命令 ====================
@@ -529,6 +662,8 @@ pub async fn save_plugin(
     let manifest_info: plugin_manager::PluginInfo = serde_json::from_value(manifest.clone())
         .map_err(|error| format!("Invalid plugin manifest: {error}"))?;
     plugin_manager::validate_plugin_manifest(&manifest_info)?;
+    let conflicts = plugin_manager::get_install_conflicts(&app, &manifest_info)?;
+    plugin_manager::reject_blocking_install_conflicts(&conflicts)?;
     let plugin_dir = plugin_manager::installed_plugin_dir(&app, &plugin_id)?;
     if !plugin_dir.exists() {
         return Err("Installed plugin not found".to_string());
@@ -549,7 +684,7 @@ pub async fn export_plugin(
     let result = app
         .dialog()
         .file()
-        .set_file_name(&format!("{}-plugin", default_name))
+        .set_file_name(format!("{}-plugin", default_name))
         .set_title("导出插件")
         .blocking_save_file();
 
@@ -577,10 +712,32 @@ pub async fn install_plugin_from_editor(
     let mut info: plugin_manager::PluginInfo = serde_json::from_value(manifest.clone())
         .map_err(|error| format!("Invalid plugin manifest: {error}"))?;
     plugin_manager::validate_plugin_manifest(&info)?;
+    let conflicts = plugin_manager::get_install_conflicts(&app, &info)?;
+    plugin_manager::reject_blocking_install_conflicts(&conflicts)?;
+    confirm_plugin_replacement(&app, &info, &conflicts)?;
     info.builtin = false;
     info.enabled = true;
-    let plugins_dir = plugin_manager::installed_plugin_dir(&app, plugin_id)?;
-    write_plugin_files(&plugins_dir, &manifest, files)?;
+    let root = plugin_manager::ensure_plugins_dir(&app)?;
+    let plugin_dir = plugin_manager::installed_plugin_dir(&app, plugin_id)?;
+    let sequence = EDITOR_INSTALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging = root.join(format!(
+        ".editor-install-{}-{}-{sequence}",
+        plugin_id,
+        std::process::id()
+    ));
+    let backup = root.join(format!(
+        ".editor-backup-{}-{}-{sequence}",
+        plugin_id,
+        std::process::id()
+    ));
+    std::fs::create_dir(&staging)
+        .map_err(|error| format!("Failed to create plugin staging directory: {error}"))?;
+    if let Err(error) = write_plugin_files(&staging, &manifest, files) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    plugin_manager::replace_plugin_directory(&staging, &plugin_dir, &backup)?;
+    enable_plugin_in_settings(&app, &info.id)?;
 
     // 触发插件更新事件
     let _ = app.emit("plugins-updated", ());

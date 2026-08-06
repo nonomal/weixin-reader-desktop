@@ -103,6 +103,13 @@ export class MenuManager {
     // 3. 标记为已初始化
     this.initialized = true;
 
+    // IPCManager 会在启动监控时立即分发一次标题事件，而 MenuManager 的
+    // Tauri 监听注册是异步的。跨书店整页导航后，这次初始事件可能先于
+    // 本监听器发生，导致原生标题栏一直保留上一家书店的章节标题。
+    // IPC 就绪后主动同步当前文档标题，后续变化仍由 ipc:title-changed 驱动。
+    await this.syncCurrentDocumentTitle();
+    if (this.destroyed) return;
+
     // 5. 订阅设置变化
     this.unsubscribeSettings = settingsStore.subscribe(async (settings) => {
       // zoom 由 Rust 端菜单直接控制（按站点存储），前端不再 invoke set_zoom
@@ -129,44 +136,69 @@ export class MenuManager {
 
     const isReader = this.checkIsReader();
 
-    // 读取当前站点的 capabilities
-    // 微信读书（weread）是根站点，全部可用；外部插件从已安装副本读取（非构建时内联值）
-    const siteId = this.siteContext.currentRuntime?.id ?? 'weread';
-    const isWeread = siteId === 'weread';
-    let capWide = true;
-    let capToolbar = true;
-    let capNavbar = true;
-    if (!isWeread) {
-      try {
-        const plugins = await invoke<any[]>('get_installed_plugins');
-        const plugin = plugins?.find((p) => p.id === siteId);
-        const caps = plugin?.capabilities ?? {};
-        capWide = !!(caps.wideMode);
-        capToolbar = !!(caps.hideToolbar);
-        capNavbar = !!(caps.hideNavbar);
-      } catch {
-        // invoke 失败时默认全可用（不阻塞菜单）
-      }
+    // 正文外不读取插件能力，直接禁用全部阅读功能。
+    if (!isReader) {
+      await this.applyMenuEnabledStatus({
+        readerWide: false,
+        hideCursor: false,
+        hideToolbar: false,
+        hideNavbar: false,
+        autoFlip: false,
+      });
+      return;
     }
 
-    try {
-      // Reader-specific items: enabled = isReader AND capability allows it
-      await invoke('set_menu_item_enabled', { id: 'reader_wide', enabled: isReader && capWide });
-      await invoke('set_menu_item_enabled', { id: 'hide_cursor', enabled: isReader });
-      await invoke('set_menu_item_enabled', { id: 'hide_toolbar', enabled: isReader && capToolbar });
-      await invoke('set_menu_item_enabled', { id: 'hide_navbar', enabled: isReader && capNavbar });
-      await invoke('set_menu_item_enabled', { id: 'auto_flip', enabled: isReader });
+    // 当前运行时已经过域名匹配和插件加载校验，直接读取它的 manifest。
+    // 不从远程阅读窗口调用插件管理 IPC，避免扩大主窗口权限。
+    const siteId = this.siteContext.siteId;
+    const isWeread = siteId === 'weread';
+    const caps = isWeread
+      ? { wideMode: true, hideToolbar: true, hideNavbar: true }
+      : this.siteContext.currentRuntime?.manifest.capabilities;
+    const capWide = caps?.wideMode === true;
+    const capToolbar = caps?.hideToolbar === true;
+    const capNavbar = caps?.hideNavbar === true;
 
-      // Zoom items - always enabled
-      await invoke('set_menu_item_enabled', { id: 'zoom_in', enabled: true });
-      await invoke('set_menu_item_enabled', { id: 'zoom_out', enabled: true });
-      await invoke('set_menu_item_enabled', { id: 'zoom_reset', enabled: true });
-    } catch (e) {
-      log.error('[MenuManager] Error updating menu enabled status:', e);
+    await this.applyMenuEnabledStatus({
+      readerWide: capWide,
+      hideCursor: true,
+      hideToolbar: capToolbar,
+      hideNavbar: capNavbar,
+      autoFlip: true,
+    });
+  }
+
+  private async applyMenuEnabledStatus(state: {
+    readerWide: boolean;
+    hideCursor: boolean;
+    hideToolbar: boolean;
+    hideNavbar: boolean;
+    autoFlip: boolean;
+  }) {
+    try {
+      await Promise.all([
+        invoke('set_menu_item_enabled', { id: 'reader_wide', enabled: state.readerWide }),
+        invoke('set_menu_item_enabled', { id: 'hide_cursor', enabled: state.hideCursor }),
+        invoke('set_menu_item_enabled', { id: 'hide_toolbar', enabled: state.hideToolbar }),
+        invoke('set_menu_item_enabled', { id: 'hide_navbar', enabled: state.hideNavbar }),
+        invoke('set_menu_item_enabled', { id: 'auto_flip', enabled: state.autoFlip }),
+        // 缩放属于壳能力，正文外仍可使用。
+        invoke('set_menu_item_enabled', { id: 'zoom_in', enabled: true }),
+        invoke('set_menu_item_enabled', { id: 'zoom_out', enabled: true }),
+        invoke('set_menu_item_enabled', { id: 'zoom_reset', enabled: true }),
+      ]);
+    } catch (error) {
+      log.error('[MenuManager] Error updating menu enabled status:', error);
     }
   }
 
   // Update window title
+  private async syncCurrentDocumentTitle() {
+    const title = document.title?.trim();
+    if (!title) return;
+    await this.updateWindowTitle(title);
+  }
+
   private async updateWindowTitle(title: string) {
     if (!window.__TAURI__) return;
 
